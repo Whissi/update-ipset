@@ -1,0 +1,575 @@
+#!/bin/bash
+# Copyright 2013 Thomas D. <whissi@whissi.de>
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# DESCRIPTION:
+#   The ‘update-ipset’ script will update a any given ipset from any given data path.
+# 
+# USAGE:
+#   update-ipset [OPTIONS] --setname <name> --settype <hash:ip|hash:net> \
+#                          --family <inet|inet6> --data-path <path>
+# 
+#######################################################################################
+#            UTF-8 character set trigger because we cannot use a BOM: äößü€           #
+#######################################################################################
+
+##
+# Global variables
+
+# Read-only variables:
+declare -r           PROGRAM_NAME="update-ipset" # The name of the application
+declare -r      PROGRAM_SHORTNAME="updipset"     # The name of the application
+declare -r        PROGRAM_VERSION="0.9.0"        # The application's version number
+declare -r                   OIFS="$IFS"         # Save the IFS if we need to restore
+
+# From <sysexits.h>
+declare -r     EX_OK=0   # Everything is fine. No error.
+declare -r  EX_ERROR=1   # General error.
+declare -r  EX_IPSET=2   # ipset error.
+declare -r  EX_USAGE=64  # Command line error, e.g. invalid argument
+declare -r  EX_IOERR=74  # An error occurred while doing I/O on some file
+declare -r EX_CONFIG=78  # Something was found in an unconfigured or misconfigured state. 
+
+declare      IS_CONFIGURED=0 # Indicates if parse_options() and do_check_config() were called
+declare   N_TOTAL_ELEMENTS=0 # Number of total added ipset entries
+declare        WAS_UPDATED=0 # Indicates if do_update_ipset() was called
+declare -a       DAT_FILES   # List of *.dat files
+
+
+# Default configuration
+unset config
+declare -A config
+config[allow_empty_set]=1
+config[data_path]=
+config[debug]=0
+config[family]=
+config[keep_working_dir]=0
+config[logger]=0
+config[quiet]=0
+config[setname]=
+config[settype]=
+config[verbose]=0
+
+
+main() {
+	parse_options "$@"
+	do_check_config
+	
+	do_setup_environment
+	
+	do_create_ipset_dump
+	do_update_ipset
+	do_handle_ipset_errors $?
+	
+	cleanup
+	
+	local log_message="ipset ‘${config[setname]}’ successfully updated (processed ${#DAT_FILES[@]} files with $N_TOTAL_ELEMENTS elements in ‘${config[data_path]}’)"
+	
+	log "$log_message"
+	
+	if [[ ${config[quiet]} -ne 1 ]]; then
+		echo ""
+		echo "$log_message!"
+	fi
+}
+
+cleanup() {
+	[[ $IS_CONFIGURED -eq 0 ]] && return 0
+	
+	if [[ $WAS_UPDATED -eq 1 ]] ; then
+		if hash ipset 2>/dev/null ; then
+			local ipset=
+			while IFS= read -r -u 3 ipset; do
+				if [[ $ipset == ${config[setname_new]} ]] ; then
+					print_verbose "Removing temporary ipset ‘${config[setname_new]}’ ..."
+					ipset destroy "${config[setname_new]}"
+				fi
+			done 3< <(ipset list -n)
+			unset ipset
+			IFS="$OIFS"	
+		fi
+	fi
+	
+	if [[ -n "${config[working_dir]}" && ${config[keep_working_dir]} -eq 1 ]]; then
+		print_verbose "Keeping working directory ‘${config[working_dir]}’ ..."
+		return 0
+	elif [[ -n "${config[working_dir]}" && -d "${config[working_dir]}" ]]; then
+		print_verbose "Removing working directory ..."
+		rm -rf "${config[working_dir]}"
+		return 0
+	fi
+	
+	
+	print_verbose "Nothing to cleanup - Working directory not set ?!"
+}
+
+##
+# Die.
+# 
+# Usage: die <exit_code> <message>
+die() {
+	local status=$1 
+	shift
+	
+	cleanup
+	
+	if [[ $IS_CONFIGURED -eq 1 ]]; then
+		local log_message="Failed to update ipset ‘${config[setname]}’ from ‘${config[data_path]}’"
+		
+		log "$log_message"
+		
+		print_error ""
+		print_error "ERROR: $log_message:"
+	fi
+	
+	print_error ""
+	print_error "${@}"
+	
+	exit $status
+}
+
+##
+# Usage: die_if_missing_arg <arg> <arg_value>
+die_if_missing_arg() {
+	local error_msg="ERROR: Missing expected argument of ‘$1’ option/parameter."
+	
+	if [[ ! "$2" ]]; then
+		die $EX_USAGE "$error_msg"
+	elif [[ "$1" != '--curl-options' && "$2" = -* ]]; then
+		die $EX_USAGE "$error_msg"
+	fi
+}
+
+##
+# Check config for any logical errors.
+do_check_config() {
+	local has_error=0
+	
+	if [[ -z ${config[setname]} ]] ; then
+		has_error=1
+		print_error "ERROR: Required parameter ‘--setname <name>’ is missing!"
+	fi
+	
+	if [[ -z ${config[settype]} ]] ; then
+		has_error=1
+		print_error "ERROR: Required parameter ‘--settype <hash:ip|hash:net>’ is missing!"
+	fi
+	
+	if [[ -z ${config[family]} ]] ; then
+		has_error=1
+		print_error "ERROR: Required parameter ‘--family <inet|inet6>’ is missing!"
+	fi
+	
+	if [[ -z ${config[data_path]} ]] ; then
+		has_error=1
+		print_error "ERROR: Required parameter ‘--data-path <path>’ is missing!"
+	fi
+	
+	if [[ ${config[verbose]} -eq 1 && ${config[quiet]} -eq 1 ]] ; then
+		has_error=1
+		print_error "ERROR: You cannot set verbose and quiet mode at the same time!"
+	fi
+	
+	if [[ $has_error != 0 ]] ; then
+		exit $EX_CONFIG
+	fi
+	
+	
+	IS_CONFIGURED=1
+}
+
+do_create_ipset_dump() {
+	print_verbose "Creating ipset dump for ipset ‘${config[setname]}’ in ‘${config[ipset_dump_file]}’ ..."
+	
+	echo "create ${config[setname]} ${config[settype]} family ${config[family]} hashsize 64" > ${config[ipset_dump_file]}
+	echo "create ${config[setname_new]} ${config[settype]} family ${config[family]} hashsize 64" >> ${config[ipset_dump_file]}
+
+	unset DAT_FILES
+	declare -g -a DAT_FILES
+	
+	local i=0
+	while IFS= read -r -u 3 -d $'\0' file; do
+		if [[ -d "$file" ]] ; then
+			print_warning "WARNING: Folder ‘$file’ skipped - you should not have any folders named ‘*.dat’ in your data path."
+			continue
+		fi
+		
+		DAT_FILES[i++]="$file"
+	done 3< <(find "${config[data_path]}" -maxdepth 1 -name '*.dat' -print0 2>/dev/null)
+	unset i file
+	IFS="$OIFS"
+	
+	if [[ ${#DAT_FILES[@]} -eq 0 ]] ; then
+		print_warning "WARNING: No ‘*.dat’ file in ‘${config[data_path]}’ found!"
+		return 0
+	fi
+	
+	local n_elements=
+	for dat_file in "${DAT_FILES[@]}" ; do
+		print_verbose "Processing ‘$dat_file’ ..."
+		
+		n_elements=0
+		while IFS= read -r -u 3 ipset_element; do
+			echo "add ${config[setname_new]} $ipset_element" >> ${config[ipset_dump_file]}
+			n_elements=$[$n_elements + 1]
+		done 3< <(grep -E -v '^(#|$)' "$dat_file" 2>/dev/null)
+		unset ipset_element
+		IFS="$OIFS"
+		
+		N_TOTAL_ELEMENTS=$[$N_TOTAL_ELEMENTS + $n_elements]
+		print_verbose "$n_elements elements added!"
+	done
+	unset dat_file n_elements
+	
+	echo "swap ${config[setname]} ${config[setname_new]}" >> ${config[ipset_dump_file]}
+	echo "destroy ${config[setname_new]}" >> ${config[ipset_dump_file]}
+}
+
+do_handle_ipset_errors() {
+	[[ $1 -eq 0 ]] && return 0
+	
+	local has_error_log=0
+	[[ -s "${config[ipset_log_error]}" ]] && has_error_log=1
+	
+	case "$1" in
+		127)
+			# ipset not found <http://tldp.org/LDP/abs/html/exitcodes.html>
+			die $EX_ERROR "ipset not found. Make sure ipset is installed and in your PATH variable!"
+			;;
+		
+		*)
+			if [[ $has_error_log -eq 1 ]] ; then
+				die $EX_IPSET "$(cat "${config[ipset_log_error]}")"
+			else
+				die $EX_IPSET "Unknown ipset error occured. No error message available."
+			fi
+			;;
+	esac
+}
+
+##
+# Validates and sets the config[output_*] values.
+# 
+# Error codes:
+#   1: General error
+#   2: Permission denied
+#   3: Path doesn't exist
+do_set_data_path() {
+	[ -z "$1" ] && return 1
+	
+	local rpath=
+	
+	if hash realpath 2>/dev/null ; then
+		# Use ‘realpath’ when available because it won't resolve symlinks,
+		# so the returned path is more ‘accurate’ to user's input
+		print_verbose "Using ‘realpath’ to verify data path value ..."
+		rpath=$(realpath --no-symlinks --quiet "$1" 2> /dev/null)
+	else
+		print_verbose "Using ‘readlink’ to verify output value ..."
+		rpath=$(readlink --canonicalize --quiet "$1" 2> /dev/null)
+	fi
+	
+	if [[ $? -ne 0 ]] ; then
+		return 2
+	fi
+	
+	if [[ ! -d $rpath ]] ; then
+		return 3
+	fi
+	
+	config[data_path]=$rpath
+	
+	
+	return 0
+}
+
+do_setup_environment() {
+	shopt -s extglob
+	
+	local tmp_target=$(mktemp -d -t "$PROGRAM_SHORTNAME.XXXXXXXXXX")
+	verify_working_dir "$tmp_target"
+	
+	# Setting variables
+	config[working_dir]="$tmp_target"                                         # Working directory
+	config[ipset_dump_file]="${config[working_dir]}/${config[setname]}.ipset" # File where we temporarly store the new version
+	config[ipset_log_error]="${config[working_dir]}/ipset-error.log"          # ipset's error log
+	config[setname_new]="${config[setname]}_new"                              # Full file path, where we finally store the meta data
+	
+	trap "die $? 'Terminated!'" SIGHUP SIGINT SIGQUIT SIGABRT SIGTERM
+}
+
+do_update_ipset() {
+	if [[ $N_TOTAL_ELEMENTS -eq 0 && ${config[allow_empty_set]} -eq 0 ]] ; then
+		die $EX_ERROR "Update canceled do to set ‘--disallow-empty-set’ option - the updated ipset would be empty (0 entries in ${#DAT_FILES[@]} files found)!"
+	fi
+	
+	print_verbose "Updating ipset ‘${config[setname]}’ ..."
+	
+	ipset -! restore -f ${config[ipset_dump_file]} 2>${config[ipset_log_error]}
+	IPSET_STATUS=$?
+	
+	WAS_UPDATED=1
+	
+	
+	return $IPSET_STATUS
+}
+
+is_valid_setname() {
+	[ -z "$1" ] && return 1
+	
+	local pattern='^[[:alnum:]][[:alnum:]_-]{2,27}$'
+	if [[ "$1" =~ $pattern ]] ; then
+		return 0
+	fi
+	
+	
+	return 1
+}
+
+is_valid_settype() {
+	[ -z "$1" ] && return 1
+	
+	local pattern='^hash:(ip|net)$'
+	if [[ "$1" =~ $pattern ]] ; then
+		return 0
+	fi
+	
+	
+	return 1
+}
+
+is_valid_family() {
+	[ -z "$1" ] && return 1
+	
+	local pattern='^(inet|inet6)$'
+	if [[ "$1" =~ $pattern ]] ; then
+		return 0
+	fi
+	
+	
+	return 1
+}
+
+log() {
+	[[ ${config[logger]} -eq 1 ]] && logger -t "$PROGRAM_NAME" "$@"
+}
+
+##
+# Usage: parse_options args
+#        args: Arguments
+parse_options() {
+	local has_error=0
+	
+	IS_CONFIGURED=0 # Make sure that do_check_config() will be called
+	
+	while [ "$1" ]; do
+		case "$1" in
+			--data-path)
+				die_if_missing_arg "$1" "$2"
+				shift
+				if ! do_set_data_path "$1"; then
+					print_error ""
+					print_error "ERROR: Invalid ‘data-path’ value ‘$1’ given!"
+					print_error "Make sure the path exist and is readable."
+					exit $EX_USAGE;
+				fi
+				shift
+				;;
+			--debug)
+				shift
+				config[debug]=1
+				set -xv
+				;;
+			--disallow-empty-set)
+				shift
+				config[allow_empty_set]=0
+				;;
+			--family)
+				die_if_missing_arg "$1" "$2"
+				shift
+				if is_valid_family "$1"; then
+					config[family]="$1"
+					shift
+				else
+					print_error ""
+					print_error "ERROR: Invalid ‘family’ value ‘$1’ given!"
+					print_error "Only ‘inet’ and ‘inet6’ are supported protocol families."
+					exit $EX_USAGE;
+				fi
+				;;
+			--setname)
+				die_if_missing_arg "$1" "$2"
+				shift
+				if is_valid_setname "$1"; then
+					config[setname]="$1"
+					shift
+				else
+					print_error ""
+					print_error "ERROR: Invalid ‘setname’ value ‘$1’ given!"
+					exit $EX_USAGE;
+				fi
+				;;
+			--settype)
+				die_if_missing_arg "$1" "$2"
+				shift
+				if is_valid_settype "$1"; then
+					config[settype]="$1"
+					shift
+				else
+					print_error ""
+					print_error "ERROR: Invalid ‘settype’ value ‘$1’ given!"
+					print_error "Only ‘hash:ip’ and ‘hash:net’ are currently supported ipset types."
+					exit $EX_USAGE;
+				fi
+				;;
+			--keep-working-dir)
+				shift
+				config[keep_working_dir]=1
+				;;
+			--logger)
+				shift
+				config[logger]=1
+				;;
+			--verbose)
+				shift
+				config[verbose]=1
+				print_program_header
+				;;
+			--version)
+				print_version
+				exit $EX_OK
+				;;
+			--quiet)
+				shift
+				config[quiet]=1
+				;;
+			--help)
+				print_usage
+				exit $EX_OK
+				;;
+			*)
+				print_error ""
+				print_error "Error: Unknown argument ‘$1’ supplied!"
+				exit $EX_USAGE;
+				;;
+		esac
+	done
+}
+
+##
+# Prints an error message to /dev/stderr.
+print_error() {
+	echo -e "$@" >> /dev/stderr
+}
+
+print_program_header() {
+	print_version
+	echo "Copyright (C) 2013 Thomas D."
+	echo ""
+}
+
+print_usage() {
+	echo "Usage: ${PROGRAM_NAME} [OPTIONS] --setname <name> --settype <hash:ip|hash:net> --family <inet|inet6> --data-path <path>"
+	echo "Updates a given ipset with data from the given path."
+	echo ""
+	echo "Options:"
+	echo "========"
+	echo "--debug"
+	echo "	This option enables the debug mode. Should be the first option for best results."
+	echo ""
+	echo "--disallow-empty-set"
+	echo "	When set, the ipset will not be updated and an error will be thrown if no entries"
+	echo "	in any file in the data path was found."
+	echo ""
+	echo "	This is useful for whitelists, for example an ipset containing all your allowed"
+	echo "	SSH IP addresses: Without this option, you could replace your ipset with an empty"
+	echo "	set due to an error-prone whitelist update, after your system isn't accessible"
+	echo "	anymore."
+	echo ""
+	echo "--keep-working-dir"
+	echo "	When set, $PROGRAM_NAME won't remove the working directory at the end."
+	echo "	Useful for debugging."
+	echo ""
+	echo "--logger"
+	echo "	Enables the usage of ‘logger’. Will only log summaries about what happened (successful"
+	echo "	or unsuccessful ipset updates), no error messages."
+	echo ""
+	echo "--quiet"
+	echo "	No output. Useful for cron jobs."
+	echo ""
+	echo "--verbose"
+	echo "	Enables verbose output."
+	echo ""
+	echo "Parameters:"
+	echo "==========="
+	echo "--data-path <path>"
+	echo "	Specifies the path where the script will look for *.dat files, which contain"
+	echo "	the IP data to be set."
+	echo ""
+	echo "--family <inet|inet6>"
+	echo "	Specifies the protocol family of the IP addresses to be stored in the set."
+	echo ""
+	echo "--setname <name>"
+	echo "	Specifies the name of the ipset you want to update."
+	echo "	Name must match the following regex: '^[[:alnum:]][[:alnum:]_-]{2,27}$'"
+	echo ""
+	echo "--settype <hash:ip|hash:net>"
+	echo "	Specifies the ipset type. Currently, this script can only update"
+	echo "	ipsets of 'hash:ip' and 'hash:net' type."
+	echo ""
+	echo "--version"
+	echo "	Output version information and exit."
+	echo ""
+	echo "--help"
+	echo "	Display this help text and exit."
+	echo ""
+}
+
+##
+# Prints a message to /dev/stdout when verbose mode is enabled.
+print_verbose() {
+	[[ ${config[verbose]} -ne 1 ]] && return
+	
+	echo "$@" >> /dev/stdout
+}
+
+print_version() {
+	echo "$PROGRAM_NAME v$PROGRAM_VERSION"
+}
+
+##
+# Prints a warning message to /dev/stderr.
+print_warning() {
+	[[ ${config[quiet]} -eq 1 ]] && return
+	
+	echo -e "$@" >> /dev/stderr
+}
+
+##
+# Usage: verify_working_dir <path>
+verify_working_dir() {
+	if [[ ! $1 ]] ; then
+		die 1 'ERROR: Temporary file path is unset!'
+	elif [[ -d $1 ]] ; then
+		cd "$1"
+	else
+		die $EX_IOERR "ERROR: Unable to create/change into working directory ‘$1’!"
+	fi
+	
+	print_verbose "Working directory is set to ‘$PWD’"
+}
+
+
+main "$@"
