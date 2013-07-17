@@ -211,27 +211,26 @@ do_create_ipset_dump() {
 	unset i file
 	IFS="$OIFS"
 	
-	if [[ ${#DAT_FILES[@]} -eq 0 ]] ; then
+	if [[ ${#DAT_FILES[@]} -gt 0 ]] ; then
+		local n_elements=
+		for dat_file in "${DAT_FILES[@]}" ; do
+			print_verbose "Processing ‘$dat_file’ ..."
+			
+			n_elements=0
+			while IFS= read -r -u 3 ipset_element; do
+				echo "add ${config[setname_new]} $ipset_element" >> ${config[ipset_dump_file]}
+				n_elements=$[$n_elements + 1]
+			done 3< <(grep -E -v '^(#|$)' "$dat_file" 2>/dev/null)
+			unset ipset_element
+			IFS="$OIFS"
+			
+			N_TOTAL_ELEMENTS=$[$N_TOTAL_ELEMENTS + $n_elements]
+			print_verbose "$n_elements elements added!"
+		done
+		unset dat_file n_elements
+	else
 		print_warning "WARNING: No ‘*.dat’ file in ‘${config[data_path]}’ found!"
-		return 0
 	fi
-	
-	local n_elements=
-	for dat_file in "${DAT_FILES[@]}" ; do
-		print_verbose "Processing ‘$dat_file’ ..."
-		
-		n_elements=0
-		while IFS= read -r -u 3 ipset_element; do
-			echo "add ${config[setname_new]} $ipset_element" >> ${config[ipset_dump_file]}
-			n_elements=$[$n_elements + 1]
-		done 3< <(grep -E -v '^(#|$)' "$dat_file" 2>/dev/null)
-		unset ipset_element
-		IFS="$OIFS"
-		
-		N_TOTAL_ELEMENTS=$[$N_TOTAL_ELEMENTS + $n_elements]
-		print_verbose "$n_elements elements added!"
-	done
-	unset dat_file n_elements
 	
 	echo "swap ${config[setname]} ${config[setname_new]}" >> ${config[ipset_dump_file]}
 	echo "destroy ${config[setname_new]}" >> ${config[ipset_dump_file]}
@@ -312,7 +311,7 @@ do_setup_environment() {
 
 do_update_ipset() {
 	if [[ $N_TOTAL_ELEMENTS -eq 0 && ${config[allow_empty_set]} -eq 0 ]] ; then
-		die $EX_ERROR "Update canceled do to set ‘--disallow-empty-set’ option - the updated ipset would be empty (0 entries in ${#DAT_FILES[@]} files found)!"
+		die $EX_ERROR "Update canceled do to set ‘--disallow-empty-set’ option - the updated ipset would be empty (${N_TOTAL_ELEMENTS} entries in ${#DAT_FILES[@]} files found)!"
 	fi
 	
 	print_verbose "Updating ipset ‘${config[setname]}’ ..."
