@@ -275,10 +275,10 @@ do_set_data_path() {
 		# Use ‘realpath’ when available because it won't resolve symlinks,
 		# so the returned path is more ‘accurate’ to user's input
 		print_verbose "Using ‘realpath’ to verify data path value ..."
-		rpath=$(realpath --no-symlinks --quiet "$1" 2> /dev/null)
+		rpath=$(realpath --no-symlinks --quiet "$1" 2>/dev/null)
 	else
 		print_verbose "Using ‘readlink’ to verify output value ..."
-		rpath=$(readlink --canonicalize --quiet "$1" 2> /dev/null)
+		rpath=$(readlink --canonicalize --quiet "$1" 2>/dev/null)
 	fi
 	
 	if [[ $? -ne 0 ]] ; then
@@ -471,7 +471,7 @@ parse_options() {
 ##
 # Prints an error message to /dev/stderr.
 print_error() {
-	echo -e "$@" >> /dev/stderr
+	echo -e "$@" >>/dev/stderr
 }
 
 print_program_header() {
@@ -542,7 +542,7 @@ print_usage() {
 print_verbose() {
 	[[ ${config[verbose]} -ne 1 ]] && return
 	
-	echo "$@" >> /dev/stdout
+	echo "$@" >>/dev/stdout
 }
 
 print_version() {
@@ -554,7 +554,7 @@ print_version() {
 print_warning() {
 	[[ ${config[quiet]} -eq 1 ]] && return
 	
-	echo -e "$@" >> /dev/stderr
+	echo -e "$@" >>/dev/stderr
 }
 
 ##
