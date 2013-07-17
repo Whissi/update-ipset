@@ -542,7 +542,7 @@ print_usage() {
 print_verbose() {
 	[[ ${config[verbose]} -ne 1 ]] && return
 	
-	echo >&1 "$@"
+	echo >&1 -e "$@"
 }
 
 print_version() {
