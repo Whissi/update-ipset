@@ -31,7 +31,7 @@
 # Read-only variables:
 declare -r           PROGRAM_NAME="update-ipset" # The name of the application
 declare -r      PROGRAM_SHORTNAME="updipset"     # The name of the application
-declare -r        PROGRAM_VERSION="0.9.0"        # The application's version number
+declare -r        PROGRAM_VERSION="0.9.1-pre"    # The application's version number
 declare -r                   OIFS="$IFS"         # Save the IFS if we need to restore
 
 # From <sysexits.h>
