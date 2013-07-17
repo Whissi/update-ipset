@@ -469,9 +469,9 @@ parse_options() {
 }
 
 ##
-# Prints an error message to /dev/stderr.
+# Prints an error message to stderr.
 print_error() {
-	echo -e "$@" >>/dev/stderr
+	echo >&2 -e "$@"
 }
 
 print_program_header() {
@@ -538,11 +538,11 @@ print_usage() {
 }
 
 ##
-# Prints a message to /dev/stdout when verbose mode is enabled.
+# Prints a message to stdout when verbose mode is enabled.
 print_verbose() {
 	[[ ${config[verbose]} -ne 1 ]] && return
 	
-	echo "$@" >>/dev/stdout
+	echo >&1 "$@"
 }
 
 print_version() {
@@ -550,11 +550,11 @@ print_version() {
 }
 
 ##
-# Prints a warning message to /dev/stderr.
+# Prints a warning message to stderr.
 print_warning() {
 	[[ ${config[quiet]} -eq 1 ]] && return
 	
-	echo -e "$@" >>/dev/stderr
+	echo >&2 -e "$@"
 }
 
 ##
