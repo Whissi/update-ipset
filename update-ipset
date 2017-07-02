@@ -42,10 +42,11 @@ declare -r  EX_USAGE=64  # Command line error, e.g. invalid argument
 declare -r  EX_IOERR=74  # An error occurred while doing I/O on some file
 declare -r EX_CONFIG=78  # Something was found in an unconfigured or misconfigured state. 
 
-declare      IS_CONFIGURED=0 # Indicates if parse_options() and do_check_config() were called
-declare   N_TOTAL_ELEMENTS=0 # Number of total added ipset entries
-declare        WAS_UPDATED=0 # Indicates if do_update_ipset() was called
-declare -a       DAT_FILES   # List of *.dat files
+declare              IS_CONFIGURED=0 # Indicates if parse_options() and do_check_config() were called
+declare           N_TOTAL_ELEMENTS=0 # Number of total added ipset entries
+declare   N_TOTAL_SKIPPED_ELEMENTS=0 # Number of total skipped ipset entries
+declare                WAS_UPDATED=0 # Indicates if do_update_ipset() was called
+declare -a                 DAT_FILES # List of *.dat files
 
 
 # Default configuration
@@ -75,7 +76,7 @@ main() {
 	
 	cleanup
 	
-	local log_message="ipset ‘${config[setname]}’ successfully updated (processed ${#DAT_FILES[@]} files with $N_TOTAL_ELEMENTS elements in ‘${config[data_path]}’)"
+	local log_message="ipset ‘${config[setname]}’ successfully updated (processed ${#DAT_FILES[@]} files with $N_TOTAL_ELEMENTS elements ($N_TOTAL_SKIPPED_ELEMENTS skipped) in ‘${config[data_path]}’)"
 	
 	log "$log_message"
 	
@@ -213,11 +214,19 @@ do_create_ipset_dump() {
 	
 	if [[ ${#DAT_FILES[@]} -gt 0 ]] ; then
 		local n_elements=
+		local n_skipped_elements=
 		for dat_file in "${DAT_FILES[@]}" ; do
 			print_verbose "Processing ‘$dat_file’ ..."
 			
 			n_elements=0
+			n_skipped_elements=0
 			while IFS= read -r -u 3 ipset_element; do
+				if [[ "${ipset_element}" =~ [^0-9a-f.:/] ]] ; then
+					print_warning "Skipping line ‘${ipset_element}’ from ‘${dat_file}’ which does not look like a valid IP notation"
+					n_skipped_elements=$[$n_skipped_elements + 1]
+					continue
+				fi
+
 				echo "add ${config[setname_new]} $ipset_element" >> ${config[ipset_dump_file]}
 				n_elements=$[$n_elements + 1]
 			done 3< <(grep -E -v '^(#|$)' "$dat_file" 2>/dev/null)
@@ -225,7 +234,8 @@ do_create_ipset_dump() {
 			IFS="$OIFS"
 			
 			N_TOTAL_ELEMENTS=$[$N_TOTAL_ELEMENTS + $n_elements]
-			print_verbose "$n_elements elements added!"
+			N_TOTAL_SKIPPED_ELEMENTS=$[$N_TOTAL_SKIPPED_ELEMENTS + $n_skipped_elements]
+			print_verbose "${n_elements elements} added, ${n_skipped_elements} elements skipped!"
 		done
 		unset dat_file n_elements
 	else
