@@ -235,7 +235,7 @@ do_create_ipset_dump() {
 			
 			N_TOTAL_ELEMENTS=$[$N_TOTAL_ELEMENTS + $n_elements]
 			N_TOTAL_SKIPPED_ELEMENTS=$[$N_TOTAL_SKIPPED_ELEMENTS + $n_skipped_elements]
-			print_verbose "${n_elements elements} added, ${n_skipped_elements} elements skipped!"
+			print_verbose "${n_elements} elements added, ${n_skipped_elements} elements skipped!"
 		done
 		unset dat_file n_elements
 	else
