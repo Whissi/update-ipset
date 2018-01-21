@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2013-2017 Thomas Deutschmann <whissi@whissi.de>
+# Copyright 2013-2019 Thomas Deutschmann <whissi@whissi.de>
 # 
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -121,7 +121,7 @@ cleanup() {
 # 
 # Usage: die <exit_code> <message>
 die() {
-	local status=$1 
+	local status=$1
 	shift
 	
 	cleanup
@@ -497,7 +497,7 @@ print_error() {
 
 print_program_header() {
 	print_version
-	echo "Copyright (C) 2013-2017 Thomas Deutschmann"
+	echo "Copyright (C) 2013-2019 Thomas Deutschmann"
 	echo ""
 }
 
