@@ -221,8 +221,20 @@ do_create_ipset_dump() {
 			n_elements=0
 			n_skipped_elements=0
 			while IFS= read -r -u 3 ipset_element; do
-				if [[ "${ipset_element}" =~ [^0-9a-f.:/] ]] ; then
-					print_warning "Skipping line ‘${ipset_element}’ from ‘${dat_file}’ which does not look like a valid IP notation"
+				case "${config[family]}" in
+					inet)
+						_pattern="[^0-9./]"
+						_message="Skipping line ‘${ipset_element}’ from ‘${dat_file}’ which does not look like a valid IPv4 notation"
+						;;
+
+					inet6)
+						_pattern="[^0-9:a-fA-F/]"
+						_message="Skipping line ‘${ipset_element}’ from ‘${dat_file}’ which does not look like a valid IPv4 notation"
+						;;
+				esac
+
+				if [[ "${ipset_element}" =~ ${_pattern} ]] ; then
+					print_verbose ${_message}
 					n_skipped_elements=$[$n_skipped_elements + 1]
 					continue
 				fi
