@@ -15,7 +15,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 # 
 # DESCRIPTION:
-#   The ‘update-ipset’ script will update a any given ipset from any given data path.
+#   The ‘update-ipset’ script updates an ipset from the files in a data directory.
 # 
 # USAGE:
 #   update-ipset [OPTIONS] --setname <name> --settype <hash:ip|hash:net> \
@@ -45,8 +45,10 @@ declare -r EX_CONFIG=78  # Something was found in an unconfigured or misconfigur
 declare              IS_CONFIGURED=0 # Indicates if parse_options() and do_check_config() were called
 declare           N_TOTAL_ELEMENTS=0 # Number of total added ipset entries
 declare   N_TOTAL_SKIPPED_ELEMENTS=0 # Number of total skipped ipset entries
+declare           TEMP_SET_CREATED=0 # Owns the temporary ipset
 declare              SET_PUBLISHED=0 # The target already contains the new data
-declare                WAS_UPDATED=0 # Indicates ownership of the temporary ipset
+declare          SET_CREATE_ACTIVE=0 # Defer signals until ownership is known
+declare             PENDING_SIGNAL=0 # Exit status of a deferred signal
 declare -a                 DAT_FILES # List of *.dat files
 
 
@@ -74,8 +76,7 @@ main() {
 	do_create_ipset_dump
 	do_update_ipset
 	do_handle_ipset_errors $?
-	
-	cleanup
+	cleanup || die $EX_IOERR "Unable to finish cleanup."
 	
 	local log_message="ipset ‘${config[setname]}’ successfully updated (processed ${#DAT_FILES[@]} files with $N_TOTAL_ELEMENTS elements ($N_TOTAL_SKIPPED_ELEMENTS skipped) in ‘${config[data_path]}’)"
 	
@@ -88,33 +89,49 @@ main() {
 }
 
 cleanup() {
-	[[ $IS_CONFIGURED -eq 0 ]] && return 0
-	
-	if [[ $WAS_UPDATED -eq 1 ]] ; then
-		if hash ipset 2>/dev/null ; then
-			local ipset=
-			while IFS= read -r -u 3 ipset; do
-				if [[ $ipset == ${config[setname_new]} ]] ; then
-					print_verbose "Removing temporary ipset ‘${config[setname_new]}’ ..."
-					ipset destroy "${config[setname_new]}"
-				fi
-			done 3< <(ipset list -n)
-			unset ipset
-			IFS="$OIFS"	
+	local status=0
+	if [[ $TEMP_SET_CREATED -eq 1 ]]; then
+		print_verbose "Removing temporary ipset ‘${config[setname_new]}’ ..."
+		if ipset destroy "${config[setname_new]}"; then
+			TEMP_SET_CREATED=0
+		else
+			print_error "Unable to remove temporary ipset ‘${config[setname_new]}’."
+			status=1
 		fi
 	fi
-	
-	if [[ -n "${config[working_dir]}" && ${config[keep_working_dir]} -eq 1 ]]; then
-		print_verbose "Keeping working directory ‘${config[working_dir]}’ ..."
-		return 0
-	elif [[ -n "${config[working_dir]}" && -d "${config[working_dir]}" ]]; then
-		print_verbose "Removing working directory ..."
-		rm -rf "${config[working_dir]}"
-		return 0
+
+	if [[ -n ${config[working_dir]} ]]; then
+		if [[ ${config[keep_working_dir]} -eq 1 ]]; then
+			print_verbose "Keeping working directory ‘${config[working_dir]}’ ..."
+			config[working_dir]=
+		elif ! rm -rf -- "${config[working_dir]}"; then
+			print_error "Unable to remove working directory ‘${config[working_dir]}’."
+			status=1
+		else
+			config[working_dir]=
+		fi
 	fi
-	
-	
-	print_verbose "Nothing to cleanup - Working directory not set ?!"
+	return "$status"
+}
+
+on_exit() {
+	local status=$1
+	trap - EXIT
+	trap '' SIGHUP SIGINT SIGQUIT SIGABRT SIGTERM
+	if ! cleanup && [[ $status -eq 0 ]]; then
+		status=$EX_IOERR
+	fi
+	exit "$status"
+}
+
+on_signal() {
+	# Bash handles signals after a foreground command returns. If create has
+	# just succeeded, record ownership before allowing the EXIT trap to run.
+	if [[ $SET_CREATE_ACTIVE -eq 1 ]]; then
+		PENDING_SIGNAL=$1
+	else
+		die "$1" "Terminated!"
+	fi
 }
 
 ##
@@ -125,15 +142,13 @@ die() {
 	local status=$1
 	shift
 	
-	cleanup
-	
 	if [[ $IS_CONFIGURED -eq 1 ]]; then
 		local log_message="Failed to update ipset ‘${config[setname]}’ from ‘${config[data_path]}’"
 		if [[ $SET_PUBLISHED -eq 1 ]]; then
 			log_message="ipset ‘${config[setname]}’ was updated, but final cleanup failed"
 		fi
 		
-		log "$log_message"
+		log "$log_message: $*"
 		
 		print_error ""
 		print_error "ERROR: $log_message:"
@@ -142,7 +157,7 @@ die() {
 	print_error ""
 	print_error "${@}"
 	
-	exit $status
+	exit "$status"
 }
 
 ##
@@ -152,7 +167,7 @@ die_if_missing_arg() {
 	
 	if [[ ! "$2" ]]; then
 		die $EX_USAGE "$error_msg"
-	elif [[ "$1" != '--curl-options' && "$2" = -* ]]; then
+	elif [[ "$2" = -* ]]; then
 		die $EX_USAGE "$error_msg"
 	fi
 }
@@ -281,7 +296,7 @@ do_handle_ipset_errors() {
 }
 
 ##
-# Validates and sets the config[output_*] values.
+# Validates and sets config[data_path].
 # 
 # Error codes:
 #   1: General error
@@ -296,14 +311,10 @@ do_set_data_path() {
 		# Use ‘realpath’ when available because it won't resolve symlinks,
 		# so the returned path is more ‘accurate’ to user's input
 		print_verbose "Using ‘realpath’ to verify data path value ..."
-		rpath=$(realpath --no-symlinks --quiet "$1" 2>/dev/null)
+		rpath=$(realpath --no-symlinks --quiet "$1" 2>/dev/null) || return 2
 	else
 		print_verbose "Using ‘readlink’ to verify output value ..."
-		rpath=$(readlink --canonicalize --quiet "$1" 2>/dev/null)
-	fi
-	
-	if [[ $? -ne 0 ]] ; then
-		return 2
+		rpath=$(readlink --canonicalize --quiet "$1" 2>/dev/null) || return 2
 	fi
 	
 	if [[ ! -d $rpath ]] ; then
@@ -317,36 +328,46 @@ do_set_data_path() {
 }
 
 do_setup_environment() {
-	shopt -s extglob
-	
-	local tmp_target=$(mktemp -d -t "$PROGRAM_SHORTNAME.XXXXXXXXXX")
-	verify_working_dir "$tmp_target"
-	
-	# Setting variables
-	config[working_dir]="$tmp_target"                                         # Working directory
-	config[ipset_dump_file]="${config[working_dir]}/${config[setname]}.ipset" # File where we temporarly store the new version
-	config[ipset_log_error]="${config[working_dir]}/ipset-error.log"          # ipset's error log
+	trap 'on_exit $?' EXIT
+	trap 'on_signal 129' SIGHUP
+	trap 'on_signal 130' SIGINT
+	trap 'on_signal 131' SIGQUIT
+	trap 'on_signal 134' SIGABRT
+	trap 'on_signal 143' SIGTERM
+	umask 077
+
+	command -v ipset >/dev/null 2>&1 || die $EX_ERROR "ipset not found in PATH."
+	config[working_dir]=$(mktemp -d -t "$PROGRAM_SHORTNAME.XXXXXXXXXX") ||
+		die $EX_IOERR "Unable to create working directory."
+	[[ -d ${config[working_dir]} ]] || die $EX_IOERR "Temporary working directory does not exist."
+
+	config[ipset_dump_file]="${config[working_dir]}/${config[setname]}.ipset"
+	config[ipset_log_error]="${config[working_dir]}/ipset-error.log"
 	# Keep temporary sets recognizable and below ipset's 31-character limit.
 	# The random suffix comes from this invocation's unique working directory.
-	config[setname_new]="${config[setname]:0:15}_tmp_${tmp_target##*.}"
+	config[setname_new]="${config[setname]:0:15}_tmp_${config[working_dir]##*.}"
+	print_verbose "Working directory is ‘${config[working_dir]}’"
 	print_verbose "Using temporary ipset ‘${config[setname_new]}’ ..."
-	
-	trap "die $? 'Terminated!'" SIGHUP SIGINT SIGQUIT SIGABRT SIGTERM
 }
 
 do_update_ipset() {
 	if [[ $N_TOTAL_ELEMENTS -eq 0 && ${config[allow_empty_set]} -eq 0 ]] ; then
-		die $EX_ERROR "Update canceled do to set ‘--disallow-empty-set’ option - the updated ipset would be empty (${N_TOTAL_ELEMENTS} entries in ${#DAT_FILES[@]} files found)!"
+		die $EX_ERROR "Update canceled due to ‘--disallow-empty-set’ - the updated ipset would be empty (${N_TOTAL_ELEMENTS} entries in ${#DAT_FILES[@]} files found)!"
 	fi
 	
 	print_verbose "Updating ipset ‘${config[setname]}’ ..."
 	
 	# Reserve our name exclusively: never reuse or destroy an existing set,
 	# even in the unlikely event of a random-name collision.
+	local status=0
+	SET_CREATE_ACTIVE=1
 	ipset create "${config[setname_new]}" "${config[settype]}" \
 		family "${config[family]}" hashsize 64 \
-		2>"${config[ipset_log_error]}" || return $?
-	WAS_UPDATED=1
+		2>"${config[ipset_log_error]}" || status=$?
+	[[ $status -ne 0 ]] || TEMP_SET_CREATED=1
+	SET_CREATE_ACTIVE=0
+	[[ $PENDING_SIGNAL -eq 0 ]] || die "$PENDING_SIGNAL" "Terminated!"
+	[[ $status -eq 0 ]] || return "$status"
 
 	ipset -! restore -f "${config[ipset_dump_file]}" 2>"${config[ipset_log_error]}" || return $?
 
@@ -354,14 +375,14 @@ do_update_ipset() {
 	# rename instead of briefly creating an empty target. If another update
 	# already created the target, swap against it; the last publication wins.
 	if ipset rename "${config[setname_new]}" "${config[setname]}" 2>"${config[ipset_log_error]}"; then
-		WAS_UPDATED=0
+		TEMP_SET_CREATED=0
 		SET_PUBLISHED=1
 		return 0
 	fi
 	ipset swap "${config[setname]}" "${config[setname_new]}" 2>"${config[ipset_log_error]}" || return $?
 	SET_PUBLISHED=1
 	ipset destroy "${config[setname_new]}" 2>"${config[ipset_log_error]}" || return $?
-	WAS_UPDATED=0
+	TEMP_SET_CREATED=0
 	return 0
 }
 
@@ -409,11 +430,9 @@ log() {
 # Usage: parse_options args
 #        args: Arguments
 parse_options() {
-	local has_error=0
-	
 	IS_CONFIGURED=0 # Make sure that do_check_config() will be called
 	
-	while [ "$1" ]; do
+	while (( $# )); do
 		case "$1" in
 			--data-path)
 				die_if_missing_arg "$1" "$2"
@@ -510,7 +529,7 @@ parse_options() {
 ##
 # Prints an error message to stderr.
 print_error() {
-	echo >&2 -e "$@"
+	printf '%s\n' "$*" >&2
 }
 
 print_program_header() {
@@ -542,11 +561,10 @@ print_usage() {
 	echo "	Useful for debugging."
 	echo ""
 	echo "--logger"
-	echo "	Enables the usage of ‘logger’. Will only log summaries about what happened (successful"
-	echo "	or unsuccessful ipset updates), no error messages."
+	echo "	Log successful updates and failure details through ‘logger’."
 	echo ""
 	echo "--quiet"
-	echo "	No output. Useful for cron jobs."
+	echo "	Suppress progress and warnings; errors are still written to stderr."
 	echo ""
 	echo "--verbose"
 	echo "	Enables verbose output."
@@ -581,7 +599,7 @@ print_usage() {
 print_verbose() {
 	[[ ${config[verbose]} -ne 1 ]] && return
 	
-	echo >&1 -e "$@"
+	printf '%s\n' "$*"
 }
 
 print_version() {
@@ -593,22 +611,7 @@ print_version() {
 print_warning() {
 	[[ ${config[quiet]} -eq 1 ]] && return
 	
-	echo >&2 -e "$@"
+	printf '%s\n' "$*" >&2
 }
-
-##
-# Usage: verify_working_dir <path>
-verify_working_dir() {
-	if [[ ! $1 ]] ; then
-		die 1 'ERROR: Temporary file path is unset!'
-	elif [[ -d $1 ]] ; then
-		cd "$1"
-	else
-		die $EX_IOERR "ERROR: Unable to create/change into working directory ‘$1’!"
-	fi
-	
-	print_verbose "Working directory is set to ‘$PWD’"
-}
-
 
 main "$@"
