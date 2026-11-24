@@ -45,7 +45,8 @@ declare -r EX_CONFIG=78  # Something was found in an unconfigured or misconfigur
 declare              IS_CONFIGURED=0 # Indicates if parse_options() and do_check_config() were called
 declare           N_TOTAL_ELEMENTS=0 # Number of total added ipset entries
 declare   N_TOTAL_SKIPPED_ELEMENTS=0 # Number of total skipped ipset entries
-declare                WAS_UPDATED=0 # Indicates if do_update_ipset() was called
+declare              SET_PUBLISHED=0 # The target already contains the new data
+declare                WAS_UPDATED=0 # Indicates ownership of the temporary ipset
 declare -a                 DAT_FILES # List of *.dat files
 
 
@@ -128,6 +129,9 @@ die() {
 	
 	if [[ $IS_CONFIGURED -eq 1 ]]; then
 		local log_message="Failed to update ipset ‘${config[setname]}’ from ‘${config[data_path]}’"
+		if [[ $SET_PUBLISHED -eq 1 ]]; then
+			log_message="ipset ‘${config[setname]}’ was updated, but final cleanup failed"
+		fi
 		
 		log "$log_message"
 		
@@ -194,8 +198,7 @@ do_check_config() {
 do_create_ipset_dump() {
 	print_verbose "Creating ipset dump for ipset ‘${config[setname]}’ in ‘${config[ipset_dump_file]}’ ..."
 	
-	echo "create ${config[setname]} ${config[settype]} family ${config[family]} hashsize 64" > ${config[ipset_dump_file]}
-	echo "create ${config[setname_new]} ${config[settype]} family ${config[family]} hashsize 64" >> ${config[ipset_dump_file]}
+	: > "${config[ipset_dump_file]}" || die $EX_IOERR "Unable to create ipset dump."
 
 	unset DAT_FILES
 	declare -g -a DAT_FILES
@@ -253,9 +256,6 @@ do_create_ipset_dump() {
 	else
 		print_warning "WARNING: No ‘*.dat’ file in ‘${config[data_path]}’ found!"
 	fi
-	
-	echo "swap ${config[setname]} ${config[setname_new]}" >> ${config[ipset_dump_file]}
-	echo "destroy ${config[setname_new]}" >> ${config[ipset_dump_file]}
 }
 
 do_handle_ipset_errors() {
@@ -326,7 +326,10 @@ do_setup_environment() {
 	config[working_dir]="$tmp_target"                                         # Working directory
 	config[ipset_dump_file]="${config[working_dir]}/${config[setname]}.ipset" # File where we temporarly store the new version
 	config[ipset_log_error]="${config[working_dir]}/ipset-error.log"          # ipset's error log
-	config[setname_new]="${config[setname]}_new"                              # Full file path, where we finally store the meta data
+	# Keep temporary sets recognizable and below ipset's 31-character limit.
+	# The random suffix comes from this invocation's unique working directory.
+	config[setname_new]="${config[setname]:0:15}_tmp_${tmp_target##*.}"
+	print_verbose "Using temporary ipset ‘${config[setname_new]}’ ..."
 	
 	trap "die $? 'Terminated!'" SIGHUP SIGINT SIGQUIT SIGABRT SIGTERM
 }
@@ -338,13 +341,28 @@ do_update_ipset() {
 	
 	print_verbose "Updating ipset ‘${config[setname]}’ ..."
 	
-	ipset -! restore -f ${config[ipset_dump_file]} 2>${config[ipset_log_error]}
-	IPSET_STATUS=$?
-	
+	# Reserve our name exclusively: never reuse or destroy an existing set,
+	# even in the unlikely event of a random-name collision.
+	ipset create "${config[setname_new]}" "${config[settype]}" \
+		family "${config[family]}" hashsize 64 \
+		2>"${config[ipset_log_error]}" || return $?
 	WAS_UPDATED=1
-	
-	
-	return $IPSET_STATUS
+
+	ipset -! restore -f "${config[ipset_dump_file]}" 2>"${config[ipset_log_error]}" || return $?
+
+	# First publication is atomic too: expose the fully populated set using
+	# rename instead of briefly creating an empty target. If another update
+	# already created the target, swap against it; the last publication wins.
+	if ipset rename "${config[setname_new]}" "${config[setname]}" 2>"${config[ipset_log_error]}"; then
+		WAS_UPDATED=0
+		SET_PUBLISHED=1
+		return 0
+	fi
+	ipset swap "${config[setname]}" "${config[setname_new]}" 2>"${config[ipset_log_error]}" || return $?
+	SET_PUBLISHED=1
+	ipset destroy "${config[setname_new]}" 2>"${config[ipset_log_error]}" || return $?
+	WAS_UPDATED=0
+	return 0
 }
 
 is_valid_setname() {
