@@ -32,7 +32,6 @@
 declare -r           PROGRAM_NAME="update-ipset" # The name of the application
 declare -r      PROGRAM_SHORTNAME="updipset"     # The name of the application
 declare -r        PROGRAM_VERSION="0.9.2"        # The application's version number
-declare -r                   OIFS="$IFS"         # Save the IFS if we need to restore
 
 # From <sysexits.h>
 declare -r     EX_OK=0   # Everything is fine. No error.
@@ -42,9 +41,13 @@ declare -r  EX_USAGE=64  # Command line error, e.g. invalid argument
 declare -r  EX_IOERR=74  # An error occurred while doing I/O on some file
 declare -r EX_CONFIG=78  # Something was found in an unconfigured or misconfigured state. 
 
+# ipset represents maxelem as an unsigned 32-bit value.
+declare -r IPSET_MAXELEM=4294967295
+declare -r IPSET_CAPACITY_RESERVE=10000
+
 declare              IS_CONFIGURED=0 # Indicates if parse_options() and do_check_config() were called
 declare           N_TOTAL_ELEMENTS=0 # Number of total added ipset entries
-declare   N_TOTAL_SKIPPED_ELEMENTS=0 # Number of total skipped ipset entries
+declare   N_TOTAL_SKIPPED_ELEMENTS=0 # Number of filtered input entries
 declare           TEMP_SET_CREATED=0 # Owns the temporary ipset
 declare              SET_PUBLISHED=0 # The target already contains the new data
 declare          SET_CREATE_ACTIVE=0 # Defer signals until ownership is known
@@ -61,6 +64,7 @@ config[debug]=0
 config[family]=
 config[keep_working_dir]=0
 config[logger]=0
+config[maxelem]=0
 config[quiet]=0
 config[setname]=
 config[settype]=
@@ -78,7 +82,7 @@ main() {
 	do_handle_ipset_errors $?
 	cleanup || die $EX_IOERR "Unable to finish cleanup."
 	
-	local log_message="ipset ‘${config[setname]}’ successfully updated (processed ${#DAT_FILES[@]} files with $N_TOTAL_ELEMENTS elements ($N_TOTAL_SKIPPED_ELEMENTS skipped) in ‘${config[data_path]}’)"
+	local log_message="ipset ‘${config[setname]}’ successfully updated (processed ${#DAT_FILES[@]} files with $N_TOTAL_ELEMENTS input entries, $N_TOTAL_SKIPPED_ELEMENTS skipped, in ‘${config[data_path]}’)"
 	
 	log "$log_message"
 	
@@ -212,65 +216,107 @@ do_check_config() {
 
 do_create_ipset_dump() {
 	print_verbose "Creating ipset dump for ipset ‘${config[setname]}’ in ‘${config[ipset_dump_file]}’ ..."
-	
-	: > "${config[ipset_dump_file]}" || die $EX_IOERR "Unable to create ipset dump."
 
-	unset DAT_FILES
-	declare -g -a DAT_FILES
-	
-	local i=0
-	while IFS= read -r -u 3 -d $'\0' file; do
-		if [[ -d "$file" ]] ; then
+	# Do not hide find/read failures in process substitutions: an incomplete
+	# source list must never replace the active set.
+	local manifest="${config[working_dir]}/sources"
+	find "${config[data_path]}" -maxdepth 1 -name '*.dat' -print0 > "$manifest" ||
+		die $EX_IOERR "Unable to enumerate data files in ‘${config[data_path]}’."
+
+	DAT_FILES=()
+	local file=
+	while IFS= read -r -d '' file; do
+		if [[ -d $file ]]; then
 			print_warning "WARNING: Folder ‘$file’ skipped - you should not have any folders named ‘*.dat’ in your data path."
 			continue
 		fi
-		
-		DAT_FILES[i++]="$file"
-	done 3< <(find "${config[data_path]}" -maxdepth 1 -name '*.dat' -print0 2>/dev/null)
-	unset i file
-	IFS="$OIFS"
-	
-	if [[ ${#DAT_FILES[@]} -gt 0 ]] ; then
-		local n_elements=
-		local n_skipped_elements=
-		for dat_file in "${DAT_FILES[@]}" ; do
-			print_verbose "Processing ‘$dat_file’ ..."
-			
-			n_elements=0
-			n_skipped_elements=0
-			while IFS= read -r -u 3 ipset_element; do
-				case "${config[family]}" in
-					inet)
-						_pattern="[^0-9./]"
-						_message="Skipping line ‘${ipset_element}’ from ‘${dat_file}’ which does not look like a valid IPv4 notation"
-						;;
+		[[ -f $file ]] || die $EX_IOERR "Data source ‘$file’ is not a regular file."
+		DAT_FILES+=("$file")
+	done < "$manifest"
 
-					inet6)
-						_pattern="[^0-9:a-fA-F/]"
-						_message="Skipping line ‘${ipset_element}’ from ‘${dat_file}’ which does not look like a valid IPv4 notation"
-						;;
-				esac
-
-				if [[ "${ipset_element}" =~ ${_pattern} ]] ; then
-					print_verbose ${_message}
-					n_skipped_elements=$[$n_skipped_elements + 1]
-					continue
-				fi
-
-				echo "add ${config[setname_new]} $ipset_element" >> ${config[ipset_dump_file]}
-				n_elements=$[$n_elements + 1]
-			done 3< <(grep -E -v '^(#|$)' "$dat_file" 2>/dev/null)
-			unset ipset_element
-			IFS="$OIFS"
-			
-			N_TOTAL_ELEMENTS=$[$N_TOTAL_ELEMENTS + $n_elements]
-			N_TOTAL_SKIPPED_ELEMENTS=$[$N_TOTAL_SKIPPED_ELEMENTS + $n_skipped_elements]
-			print_verbose "${n_elements} elements added, ${n_skipped_elements} elements skipped!"
-		done
-		unset dat_file n_elements
+	local snapshot="${config[working_dir]}/source.dat"
+	local count_file="${config[working_dir]}/source.count"
+	local parse_error="${config[working_dir]}/parse-error.log"
+	local n_elements=0 n_skipped=0 source_elements=0 required_elements=0 status=0
+	exec 4>"${config[ipset_dump_file]}" || die $EX_IOERR "Unable to create ipset dump."
+	for file in "${DAT_FILES[@]}"; do
+		print_verbose "Processing ‘$file’ ..."
+		# Keep checked copies so source read failures cannot publish partial data.
+		[[ -f $file ]] || die $EX_IOERR "Data source ‘$file’ is no longer a regular file."
+		cat -- "$file" > "$snapshot" || die $EX_IOERR "Unable to read data source ‘$file’."
+		# Process each file in one buffered pass rather than executing shell
+		# commands and issuing a write for every input line. Pass paths through
+		# the environment so awk does not interpret their backslash escapes.
+		status=0
+		UPDIPSET_SOURCE="$file" UPDIPSET_COUNT_FILE="$count_file" \
+			awk -v set_name="${config[setname_new]}" -v family="${config[family]}" \
+				-v set_type="${config[settype]}" -v max_capacity="$IPSET_MAXELEM" \
+				-v verbose="${config[verbose]}" '
+			BEGIN {
+				pattern = family == "inet6" ? "^[0-9:a-fA-F./]+$" : "^[0-9./]+$"
+			}
+			{
+				entry = $0
+				sub(/^[[:space:]]+/, "", entry)
+				sub(/[[:space:]]+$/, "", entry)
+				if (entry == "" || entry ~ /^#/) next
+				if (entry !~ pattern || (family == "inet6" && entry !~ /:/)) {
+					if (verbose)
+						printf "Skipping non-%s or invalid entry in %s at line %d: %s\n", \
+							family, ENVIRON["UPDIPSET_SOURCE"], NR, entry > "/dev/stderr"
+					skipped++
+					next
+				}
+				# A CIDR is one network in hash:net, but hash:ip expands IPv4
+				# prefixes into individual addresses. Invalid prefixes are
+				# still rejected by ipset before publication.
+				elements = 1
+				if (set_type == "hash:ip" && family == "inet" &&
+				    split(entry, parts, "/") == 2 && parts[2] ~ /^[0-9]+$/) {
+					prefix = parts[2] + 0
+					# ipset interprets leading-zero numbers as octal.
+					if (parts[2] ~ /^0[0-7]+$/) {
+						prefix = 0
+						for (i = 1; i <= length(parts[2]) && prefix <= 32; i++)
+							prefix = prefix * 8 + substr(parts[2], i, 1)
+					}
+					if (prefix >= 1 && prefix <= 32) elements = 2 ^ (32 - prefix)
+				}
+				required += elements
+				if (required > max_capacity) required = max_capacity
+				printf "add %s %s\n", set_name, entry
+				count++
+			}
+			END {
+				# Detect buffered output errors before allowing publication.
+				if (fflush() != 0) exit 74
+				count_file = ENVIRON["UPDIPSET_COUNT_FILE"]
+				printf "%.0f %.0f %.0f\n", count, required, skipped > count_file
+				if (close(count_file) != 0) exit 74
+			}' < "$snapshot" >&4 2>"$parse_error" || status=$?
+		if [[ $status -ne 0 ]]; then
+			die $EX_IOERR "Unable to process data source ‘$file’: $(< "$parse_error")"
+		fi
+		if [[ ${config[verbose]} -eq 1 && -s $parse_error ]]; then
+			cat -- "$parse_error" || die $EX_IOERR "Unable to report skipped entries."
+		fi
+		read -r n_elements source_elements n_skipped < "$count_file" || die $EX_IOERR "Unable to read input entry count."
+		((N_TOTAL_ELEMENTS += n_elements))
+		((N_TOTAL_SKIPPED_ELEMENTS += n_skipped))
+		((required_elements += source_elements))
+		if (( required_elements > IPSET_MAXELEM )); then
+			required_elements=$IPSET_MAXELEM
+		fi
+		print_verbose "$n_elements input entries added; $n_skipped skipped!"
+	done
+	exec 4>&- || die $EX_IOERR "Unable to close ipset dump."
+	if (( required_elements > IPSET_MAXELEM - IPSET_CAPACITY_RESERVE )); then
+		config[maxelem]=$IPSET_MAXELEM
 	else
-		print_warning "WARNING: No ‘*.dat’ file in ‘${config[data_path]}’ found!"
+		config[maxelem]=$((required_elements + IPSET_CAPACITY_RESERVE))
 	fi
+	print_verbose "Using maxelem=${config[maxelem]} (estimated elements: $required_elements)."
+	[[ ${#DAT_FILES[@]} -gt 0 ]] || print_warning "WARNING: No ‘*.dat’ file in ‘${config[data_path]}’ found!"
 }
 
 do_handle_ipset_errors() {
@@ -337,6 +383,7 @@ do_setup_environment() {
 	umask 077
 
 	command -v ipset >/dev/null 2>&1 || die $EX_ERROR "ipset not found in PATH."
+	command -v awk >/dev/null 2>&1 || die $EX_ERROR "awk not found in PATH."
 	config[working_dir]=$(mktemp -d -t "$PROGRAM_SHORTNAME.XXXXXXXXXX") ||
 		die $EX_IOERR "Unable to create working directory."
 	[[ -d ${config[working_dir]} ]] || die $EX_IOERR "Temporary working directory does not exist."
@@ -362,7 +409,7 @@ do_update_ipset() {
 	local status=0
 	SET_CREATE_ACTIVE=1
 	ipset create "${config[setname_new]}" "${config[settype]}" \
-		family "${config[family]}" hashsize 64 \
+		family "${config[family]}" hashsize 64 maxelem "${config[maxelem]}" \
 		2>"${config[ipset_log_error]}" || status=$?
 	[[ $status -ne 0 ]] || TEMP_SET_CREATED=1
 	SET_CREATE_ACTIVE=0
